@@ -13,6 +13,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -183,5 +184,66 @@ class DefaultPartitionedSearchPhaseTest {
                 .hasCause(new IllegalStateException("Solver thread was interrupted in Partitioned Search."))
                 .hasRootCauseExactlyInstanceOf(InterruptedException.class);
     }
+
+    @Test
+    @Timeout(60)
+    void solvePartitionedWithProblemChange() throws InterruptedException {
+
+        // Uncomment below to run a non-partitioned daemon solver
+        /*
+        SolverConfig solverConfig = PlannerTestUtils.buildSolverConfig(TestdataSolution.class, TestdataEntity.class);
+        solverConfig.setDaemon(true); // Avoid terminating the solver too quickly.
+        SolverFactory<TestdataSolution> solverFactory = SolverFactory.create(solverConfig);
+        Solver<TestdataSolution> solver = solverFactory.buildSolver();
+         */
+
+        //create a partitioned daemon solver
+        SolverFactory<TestdataSolution> solverFactory = createSolverFactory(true, SolverConfig.MOVE_THREAD_COUNT_NONE,
+                1);
+        Solver<TestdataSolution> solver = solverFactory.buildSolver();
+
+        final int valueCount = 4;
+        TestdataSolution solution = TestdataSolution.generateSolution(valueCount, valueCount);
+
+        AtomicReference<TestdataSolution> bestSolution = new AtomicReference<>();
+        CountDownLatch solutionWithProblemChangeReceived = new CountDownLatch(1);
+
+        CountDownLatch solvingStarted = new CountDownLatch(1);
+        ((DefaultSolver<TestdataSolution>) solver).addPhaseLifecycleListener(
+                new PhaseLifecycleListenerAdapter<TestdataSolution>() {
+                    @Override
+                    public void solvingStarted(SolverScope<TestdataSolution> solverScope) {
+                        solvingStarted.countDown();
+                    }
+                });
+
+
+        solver.addEventListener(bestSolutionChangedEvent -> {
+            if (bestSolutionChangedEvent.isEveryProblemChangeProcessed()) {
+                TestdataSolution newBestSolution = bestSolutionChangedEvent.getNewBestSolution();
+                if (newBestSolution.getValueList().size() == valueCount + 1) {
+                    bestSolution.set(newBestSolution);
+                    solutionWithProblemChangeReceived.countDown();
+                }
+            }
+        });
+
+        ExecutorService executorService = Executors.newSingleThreadExecutor();
+        executorService.submit(() -> {
+            solver.solve(solution);
+        });
+
+        solvingStarted.await(); // Make sure we submit a ProblemChange only after the Solver started solving.
+        solver.addProblemChange((workingSolution, problemChangeDirector) -> {
+            problemChangeDirector.addProblemFact(new TestdataValue("added value"), solution.getValueList()::add);
+        });
+
+        solutionWithProblemChangeReceived.await();
+        assertThat(bestSolution.get().getValueList()).hasSize(valueCount + 1);
+
+        solver.terminateEarly();
+        executorService.shutdown();
+    }
+
 
 }
